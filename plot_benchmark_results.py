@@ -32,6 +32,7 @@ KERNEL_NAMES = {
     9: "Autotuning",
     10: "Warptiling",
     11: "Double Buffering",
+    12: "Double Buffering (barrier)",
 }
 
 
@@ -45,12 +46,18 @@ def parse_file(file):
         lines = [line.strip() for line in f.readlines()]
 
     data = {"size": [], "gflops": []}
-    pattern = "Average elapsed time: \((.*?)\) s, performance: \((.*?)\) GFLOPS. size: \((.*?)\)."
+    pattern = r"Average elapsed time: \((.*?)\) s, performance: \((.*?)\) GFLOPS. size: \((.*?)\)."
     for line in lines:
         if r := re.match(pattern, line):
             data["size"].append(int(r.group(3)))
             data["gflops"].append(float(r.group(2)))
     return data
+
+
+def parse_csv(file):
+    """Read the machine-readable output emitted by sgemm --csv."""
+    frame = pd.read_csv(file)
+    return frame[["kernel", "size", "gflops"]]
 
 
 def plot(df: pd.DataFrame):
@@ -62,7 +69,8 @@ def plot(df: pd.DataFrame):
     save_dir = Path.cwd()
 
     plt.figure(figsize=(18, 10))
-    colors = sn.color_palette("husl", len(df["kernel"].unique()))
+    kernel_ids = sorted(df["kernel"].unique())
+    colors = dict(zip(kernel_ids, sn.color_palette("husl", len(kernel_ids))))
     sn.lineplot(data=df, x="size", y="gflops", hue="kernel", palette=colors)
     # also plot points, but without legend
     sn.scatterplot(data=df, x="size", y="gflops", hue="kernel", palette=colors, legend=False)
@@ -74,13 +82,13 @@ def plot(df: pd.DataFrame):
     # add small lines at the xticks
 
     # display the kernel names right next to the corresponding line
-    for i, kernel in enumerate(df["kernel"].unique()):
+    for kernel in kernel_ids:
         # right align the text
         plt.text(
-            df[df["kernel"] == i]["size"].iloc[-1],
-            df[df["kernel"] == i]["gflops"].iloc[-1] + 300,
-            f"{i}:{KERNEL_NAMES[i]}",
-            color=colors[i],
+            df[df["kernel"] == kernel]["size"].iloc[-1],
+            df[df["kernel"] == kernel]["gflops"].iloc[-1] + 300,
+            f"{kernel}:{KERNEL_NAMES[kernel]}",
+            color=colors[kernel],
             horizontalalignment="left",
             weight="medium",
         )
@@ -101,15 +109,25 @@ if __name__ == "__main__":
     assert results_dir.is_dir()
 
     data = []
-    for filename in results_dir.glob("*.txt"):
-        # filenames have the format: <kernel_nr>_output.txt
-        if not filename.stem.split("_")[0].isdigit() and "_output" not in filename.stem:
-            continue
-        results_dict = parse_file(filename)
-        kernel_nr = int(filename.stem.split("_")[0])
-        for size, gflops in zip(results_dict["size"], results_dict["gflops"]):
-            data.append({"kernel": kernel_nr, "size": size, "gflops": gflops})
-    df = pd.DataFrame(data)
+    csv_files = sorted(results_dir.glob("*_output.csv"))
+    if csv_files:
+        data.extend(parse_csv(filename) for filename in csv_files)
+    else:
+        # Keep compatibility with benchmark logs generated before --csv.
+        for filename in results_dir.glob("*.txt"):
+            # filenames have the format: <kernel_nr>_output.txt
+            if not filename.stem.split("_")[0].isdigit() or "_output" not in filename.stem:
+                continue
+            results_dict = parse_file(filename)
+            kernel_nr = int(filename.stem.split("_")[0])
+            data.append(pd.DataFrame({
+                "kernel": [kernel_nr] * len(results_dict["size"]),
+                "size": results_dict["size"],
+                "gflops": results_dict["gflops"],
+            }))
+    if not data:
+        raise RuntimeError("No benchmark output files found in benchmark_results/")
+    df = pd.concat(data, ignore_index=True)
 
     plot(df)
 

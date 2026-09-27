@@ -52,11 +52,9 @@ void CudaDeviceInfo() {
 };
 
 void randomize_matrix(float *mat, int N) {
-  // NOTICE: Use gettimeofday instead of srand((unsigned)time(NULL)); the time
-  // precision is too low and the same random number is generated.
-  struct timeval time {};
-  gettimeofday(&time, nullptr);
-  srand(time.tv_usec);
+  // Seed the process once in the caller.  Reseeding here would make matrices
+  // generated close together in time identical and would make reproducible
+  // tests impossible.
   for (int i = 0; i < N; i++) {
     float tmp = (float)(rand() % 5) + 0.01 * (rand() % 5);
     tmp = (rand() % 2 == 0) ? tmp : tmp * (-1.);

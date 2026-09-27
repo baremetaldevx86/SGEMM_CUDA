@@ -37,6 +37,11 @@ GFLOPs at matrix size 4096x4096:
     ```
 1. Build: `mkdir build && cd build && cmake .. && cmake --build .`
 1. Run one of the kernels: `DEVICE=<device_id> ./sgemm <kernel number>`
+   Optional benchmark controls are available for warmup launches, timed
+   iterations, reproducible inputs, and machine-readable output:
+   ```bash
+   ./sgemm 10 --warmup 5 --iters 50 --seed 1234 --csv benchmark.csv
+   ```
 1. Profiling via [NVIDIA Nsight Compute](https://developer.nvidia.com/nsight-compute) (ncu): `make profile KERNEL=<kernel number>`
 
 Credit goes to [wangzyon/NVIDIA_SGEMM_PRACTICE](https://github.com/wangzyon/NVIDIA_SGEMM_PRACTICE) for the benchmarking setup.

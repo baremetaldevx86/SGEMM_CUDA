@@ -2,15 +2,20 @@
 
 set -euo pipefail
 
-# This scripts runs the ./sgemm binary for all exiting kernels, and logs
-# the outputs to text files in benchmark_results/. Then it calls
-# the plotting script
+# This script runs the ./sgemm binary for all existing kernels and logs
+# both human-readable and CSV output in benchmark_results/.
 
 mkdir -p benchmark_results
 
-for kernel in {0..10}; do
+WARMUP="${WARMUP:-5}"
+ITERS="${ITERS:-50}"
+SEED="${SEED:-1234}"
+
+for kernel in {0..12}; do
     echo ""
-    ./build/sgemm $kernel | tee "benchmark_results/${kernel}_output.txt"
+    ./build/sgemm "$kernel" --warmup "$WARMUP" --iters "$ITERS" \
+        --seed "$SEED" --csv "benchmark_results/${kernel}_output.csv" \
+        | tee "benchmark_results/${kernel}_output.txt"
     sleep 2
 done
 

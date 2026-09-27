@@ -2,27 +2,124 @@
 #include <cstdlib>
 #include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <runner.cuh>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
 
 const std::string errLogFile = "matrixValidationFailure.txt";
 
-int main(int argc, char **argv) {
-  if (argc != 2) {
-    std::cerr << "Please select a kernel (range 0 - 12, 0 for NVIDIA cuBLAS)"
-              << std::endl;
-    exit(EXIT_FAILURE);
+struct Options {
+  int kernel = -1;
+  int warmup = 5;
+  int iterations = 50;
+  unsigned int seed = 1234;
+  std::string csv_path;
+};
+
+void print_usage(const char *program) {
+  std::cerr
+      << "Usage: " << program
+      << " <kernel> [--warmup N] [--iters N] [--seed N] [--csv FILE]\n"
+      << "       " << program
+      << " --kernel N [--warmup N] [--iters N] [--seed N] [--csv FILE]\n"
+      << "  kernel: 0-12 (0 selects NVIDIA cuBLAS)\n"
+      << "  warmup: untimed launches before benchmarking (default: 5)\n"
+      << "  iters:  timed launches per matrix size (default: 50)\n"
+      << "  seed:   random input seed (default: 1234)\n"
+      << "  csv:    write one result row per matrix size to FILE\n";
+}
+
+int parse_integer(const std::string &value, const char *option) {
+  std::size_t parsed = 0;
+  int result = 0;
+  try {
+    result = std::stoi(value, &parsed);
+  } catch (const std::exception &) {
+    throw std::invalid_argument(std::string("Invalid value for ") + option +
+                                ": " + value);
+  }
+  if (parsed != value.size()) {
+    throw std::invalid_argument(std::string("Invalid value for ") + option +
+                                ": " + value);
+  }
+  return result;
+}
+
+unsigned int parse_seed(const std::string &value) {
+  std::size_t parsed = 0;
+  unsigned long result = 0;
+  try {
+    result = std::stoul(value, &parsed);
+  } catch (const std::exception &) {
+    throw std::invalid_argument("Invalid value for --seed: " + value);
+  }
+  if (parsed != value.size() || result > std::numeric_limits<unsigned int>::max()) {
+    throw std::invalid_argument("Invalid value for --seed: " + value);
+  }
+  return static_cast<unsigned int>(result);
+}
+
+Options parse_options(int argc, char **argv) {
+  Options options;
+  for (int i = 1; i < argc; ++i) {
+    const std::string argument = argv[i];
+    if (argument == "--help" || argument == "-h") {
+      print_usage(argv[0]);
+      std::exit(EXIT_SUCCESS);
+    }
+
+    auto require_value = [&](const char *option) -> std::string {
+      if (i + 1 >= argc) {
+        throw std::invalid_argument(std::string("Missing value for ") + option);
+      }
+      return argv[++i];
+    };
+
+    if (argument == "--kernel") {
+      options.kernel = parse_integer(require_value("--kernel"), "--kernel");
+    } else if (argument == "--warmup") {
+      options.warmup = parse_integer(require_value("--warmup"), "--warmup");
+    } else if (argument == "--iters") {
+      options.iterations = parse_integer(require_value("--iters"), "--iters");
+    } else if (argument == "--seed") {
+      options.seed = parse_seed(require_value("--seed"));
+    } else if (argument == "--csv") {
+      options.csv_path = require_value("--csv");
+    } else if (!argument.empty() && argument.front() != '-' && options.kernel < 0) {
+      options.kernel = parse_integer(argument, "kernel");
+    } else {
+      throw std::invalid_argument("Unknown argument: " + argument);
+    }
   }
 
-  // get kernel number
-  int kernel_num = std::stoi(argv[1]);
-  if (kernel_num < 0 || kernel_num > 12) {
-    std::cerr << "Please enter a valid kernel number (0-12)" << std::endl;
+  if (options.kernel < 0 || options.kernel > 12) {
+    throw std::invalid_argument("Please select a kernel in the range 0-12");
+  }
+  if (options.warmup < 0) {
+    throw std::invalid_argument("--warmup must be non-negative");
+  }
+  if (options.iterations <= 0) {
+    throw std::invalid_argument("--iters must be greater than zero");
+  }
+  return options;
+}
+
+int main(int argc, char **argv) {
+  Options options;
+  try {
+    options = parse_options(argc, argv);
+  } catch (const std::exception &error) {
+    std::cerr << error.what() << "\n\n";
+    print_usage(argv[0]);
     exit(EXIT_FAILURE);
   }
+  const int kernel_num = options.kernel;
 
   // get environment variable for device
   int deviceIdx = 0;
@@ -32,6 +129,8 @@ int main(int argc, char **argv) {
   cudaCheck(cudaSetDevice(deviceIdx));
 
   printf("Running kernel %d on device %d.\n", kernel_num, deviceIdx);
+  printf("Configuration: warmup=%d, iterations=%d, seed=%u\n", options.warmup,
+         options.iterations, options.seed);
 
   // print some device info
   // CudaDeviceInfo();
@@ -66,6 +165,18 @@ int main(int argc, char **argv) {
   float *dA = nullptr, *dB = nullptr, *dC = nullptr,
         *dC_ref = nullptr; // device matrices
 
+  std::ofstream csv;
+  if (!options.csv_path.empty()) {
+    csv.open(options.csv_path);
+    if (!csv) {
+      std::cerr << "Unable to open CSV output file: " << options.csv_path
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    csv << "kernel,size,average_seconds,gflops,warmup,iters,seed,verified\n";
+  }
+
+  std::srand(options.seed);
   A = (float *)malloc(sizeof(float) * max_size * max_size);
   B = (float *)malloc(sizeof(float) * max_size * max_size);
   C = (float *)malloc(sizeof(float) * max_size * max_size);
@@ -89,7 +200,6 @@ int main(int argc, char **argv) {
   cudaCheck(cudaMemcpy(dC_ref, C, sizeof(float) * max_size * max_size,
                        cudaMemcpyHostToDevice));
 
-  int repeat_times = 50;
   for (int size : SIZE) {
     m = n = k = size;
 
@@ -97,6 +207,7 @@ int main(int argc, char **argv) {
               << ", beta: " << beta << std::endl;
     // Verify the correctness of the calculation, and execute it once before the
     // kernel function timing to avoid cold start errors
+    bool verified = kernel_num == 0;
     if (kernel_num != 0) {
       run_kernel(0, m, n, k, alpha, dA, dB, beta, dC_ref,
                  handle); // cuBLAS
@@ -127,10 +238,20 @@ int main(int argc, char **argv) {
         }
         exit(EXIT_FAILURE);
       }
+      verified = true;
     }
 
+    for (int j = 0; j < options.warmup; ++j) {
+      run_kernel(kernel_num, m, n, k, alpha, dA, dB, beta, dC, handle);
+    }
+    cudaCheck(cudaDeviceSynchronize());
+    // Start timed launches from the same C matrix every time. This also
+    // prevents warmup launches from changing the benchmark's beta term.
+    cudaCheck(cudaMemcpy(dC, dC_ref, sizeof(float) * m * n,
+                         cudaMemcpyDeviceToDevice));
+
     cudaEventRecord(beg);
-    for (int j = 0; j < repeat_times; j++) {
+    for (int j = 0; j < options.iterations; j++) {
       // We don't reset dC between runs to save time
       run_kernel(kernel_num, m, n, k, alpha, dA, dB, beta, dC, handle);
     }
@@ -144,8 +265,15 @@ int main(int argc, char **argv) {
     printf(
         "Average elapsed time: (%7.6f) s, performance: (%7.1f) GFLOPS. size: "
         "(%ld).\n",
-        elapsed_time / repeat_times,
-        (repeat_times * flops * 1e-9) / elapsed_time, m);
+        elapsed_time / options.iterations,
+        (options.iterations * flops * 1e-9) / elapsed_time, m);
+    if (csv) {
+      csv << kernel_num << ',' << m << ',' << std::fixed << std::setprecision(9)
+          << (elapsed_time / options.iterations) << ',' << std::setprecision(3)
+          << ((options.iterations * flops * 1e-9) / elapsed_time) << ','
+          << options.warmup << ',' << options.iterations << ',' << options.seed
+          << ',' << (verified ? "true" : "false") << '\n';
+    }
     fflush(stdout);
     // make dC and dC_ref equal again (we modified dC while calling our kernel
     // for benchmarking)
