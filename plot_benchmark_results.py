@@ -55,8 +55,44 @@ def parse_file(file):
 
 
 def parse_csv(file):
-    """Read the machine-readable output emitted by sgemm --csv."""
+    """Read a square-sweep CSV, including schemas from before M/N/K columns.
+
+    This plot has only one size axis. Reject non-cube workloads rather than
+    dropping their blank size values or labeling them as square benchmarks.
+    """
     frame = pd.read_csv(file)
+    required = {"kernel", "size", "gflops"}
+    missing = required.difference(frame.columns)
+    if missing:
+        raise ValueError(f"{file}: missing required CSV columns: {', '.join(sorted(missing))}")
+
+    dimensions = {"m", "n", "k"}
+    present = dimensions.intersection(frame.columns)
+    if present and present != dimensions:
+        raise ValueError(f"{file}: dimension columns m, n, k must all be present")
+
+    def positive_integers(column):
+        values = pd.to_numeric(frame[column], errors="coerce")
+        valid = values.notna() & values.gt(0) & values.mod(1).eq(0)
+        if not valid.all():
+            row = valid[~valid].index[0] + 2  # Include the CSV header.
+            raise ValueError(f"{file}: CSV row {row}: {column} must be a positive integer")
+        return values
+
+    if present:
+        m, n, k = (positive_integers(column) for column in ("m", "n", "k"))
+        rectangular = m.ne(n) | m.ne(k)
+        if rectangular.any():
+            index = rectangular[rectangular].index[0]
+            raise ValueError(
+                f"{file}: CSV row {index + 2}: rectangular/non-cube workload "
+                f"M={m[index]}, N={n[index]}, K={k[index]} is not supported by "
+                "this square-sweep plot; use only rows with M=N=K"
+            )
+
+    frame["size"] = positive_integers("size")
+    if present and frame["size"].ne(m).any():
+        raise ValueError(f"{file}: size must match m=n=k for square-sweep plotting")
     return frame[["kernel", "size", "gflops"]]
 
 

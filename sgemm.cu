@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <kernel_registry.h>
 #include <runner.cuh>
 #include <stdexcept>
 #include <string>
@@ -23,7 +24,11 @@ static void check_cublas(cublasStatus_t status, const char *operation) {
 const std::string errLogFile = "matrixValidationFailure.txt";
 
 struct Options {
-  int kernel = -1;
+  int kernel = kAutoKernel;
+  std::string requested_kernel;
+  bool list_kernels = false;
+  bool custom_shape = false;
+  GemmShape shape{0, 0, 0};
   int warmup = 5;
   int iterations = 50;
   unsigned int seed = 1234;
@@ -35,12 +40,15 @@ struct Options {
 void print_usage(const char *program) {
   std::cerr
       << "Usage: " << program
-      << " <kernel> [--warmup N] [--iters N] [--seed N] [--csv FILE]"
-         " [--alpha X] [--beta X]\n"
-      << "       " << program
-      << " --kernel N [--warmup N] [--iters N] [--seed N] [--csv FILE]"
-         " [--alpha X] [--beta X]\n"
-      << "  kernel: 0-12 (0 selects NVIDIA cuBLAS)\n"
+      << " <ID|name|auto> [--m M --n N --k K] [--warmup N] [--iters N]"
+         " [--seed N] [--csv FILE] [--alpha X] [--beta X]\n"
+      << "       " << program << " --kernel <ID|name|auto> [same options]\n"
+      << "       " << program << " --list-kernels\n"
+      << "  kernel: 0-12 or canonical name (0 selects NVIDIA cuBLAS)\n"
+      << "  auto:   deterministic heuristic policy, not measured tuning\n"
+      << "  --list-kernels: standalone host-only listing; no GPU required\n"
+      << "  --m/--n/--k: all three positive dimensions, each specified once;\n"
+      << "              otherwise use the default square sweep\n"
       << "  warmup: untimed launches before benchmarking (default: 5)\n"
       << "  iters:  timed launches per matrix size (default: 50)\n"
       << "  seed:   random input seed (default: 1234)\n"
@@ -103,6 +111,34 @@ unsigned int parse_seed(const std::string &value) {
 Options parse_options(int argc, char **argv) {
   Options options;
   bool kernel_specified = false;
+  bool m_specified = false, n_specified = false, k_specified = false;
+  auto set_kernel = [&](const std::string &token) {
+    if (kernel_specified) {
+      throw std::invalid_argument("Specify the kernel only once");
+    }
+    options.requested_kernel = token;
+    if (token == "auto") {
+      options.kernel = kAutoKernel;
+    } else if (const KernelDescriptor *descriptor = find_kernel(token)) {
+      options.kernel = descriptor->id;
+    } else {
+      // Keep the legacy integer spelling accepted by std::stoi (notably
+      // leading-zero IDs and +N in --kernel), while names remain exact.
+      try {
+        const int numeric_id = parse_integer(token, "kernel");
+        if (const KernelDescriptor *descriptor = find_kernel(numeric_id)) {
+          options.kernel = descriptor->id;
+          kernel_specified = true;
+          return;
+        }
+      } catch (const std::exception &) {
+        // Report a consistent unknown-kernel diagnostic below.
+      }
+      throw std::invalid_argument("Unknown kernel: " + token +
+                                  "; use --list-kernels for valid IDs/names");
+    }
+    kernel_specified = true;
+  };
   for (int i = 1; i < argc; ++i) {
     const std::string argument = argv[i];
     if (argument == "--help" || argument == "-h") {
@@ -117,12 +153,27 @@ Options parse_options(int argc, char **argv) {
       return argv[++i];
     };
 
-    if (argument == "--kernel") {
-      if (kernel_specified) {
-        throw std::invalid_argument("Specify the kernel only once");
+    if (argument == "--list-kernels") {
+      if (argc != 2) {
+        throw std::invalid_argument("--list-kernels must be used standalone");
       }
-      options.kernel = parse_integer(require_value("--kernel"), "--kernel");
-      kernel_specified = true;
+      options.list_kernels = true;
+      return options;
+    } else if (argument == "--kernel") {
+      set_kernel(require_value("--kernel"));
+    } else if (argument == "--m" || argument == "--n" || argument == "--k") {
+      bool &specified = argument == "--m" ? m_specified
+                        : argument == "--n" ? n_specified : k_specified;
+      int &dimension = argument == "--m" ? options.shape.m
+                       : argument == "--n" ? options.shape.n : options.shape.k;
+      if (specified) {
+        throw std::invalid_argument("Specify " + argument + " only once");
+      }
+      dimension = parse_integer(require_value(argument.c_str()), argument.c_str());
+      if (dimension <= 0) {
+        throw std::invalid_argument(argument + " must be positive");
+      }
+      specified = true;
     } else if (argument == "--warmup") {
       options.warmup = parse_integer(require_value("--warmup"), "--warmup");
     } else if (argument == "--iters") {
@@ -139,15 +190,23 @@ Options parse_options(int argc, char **argv) {
         throw std::invalid_argument("--csv requires a non-empty path");
       }
     } else if (!argument.empty() && argument.front() != '-' && !kernel_specified) {
-      options.kernel = parse_integer(argument, "kernel");
-      kernel_specified = true;
+      set_kernel(argument);
     } else {
       throw std::invalid_argument("Unknown argument: " + argument);
     }
   }
 
-  if (options.kernel < 0 || options.kernel > 12) {
-    throw std::invalid_argument("Please select a kernel in the range 0-12");
+  if (!kernel_specified) {
+    throw std::invalid_argument("Please select a kernel ID, name, or auto");
+  }
+  options.custom_shape = m_specified || n_specified || k_specified;
+  if (options.custom_shape && !(m_specified && n_specified && k_specified)) {
+    throw std::invalid_argument("--m, --n, and --k must all be specified together");
+  }
+  if (options.custom_shape) {
+    if (const char *error = problem_shape_error(options.shape)) {
+      throw std::invalid_argument(error);
+    }
   }
   if (options.warmup < 0) {
     throw std::invalid_argument("--warmup must be non-negative");
@@ -158,6 +217,36 @@ Options parse_options(int argc, char **argv) {
   return options;
 }
 
+void list_kernels() {
+  std::cout << "Available kernels (IDs and canonical names):\n";
+  for (const KernelDescriptor &kernel : kernel_registry()) {
+    std::cout << "  " << kernel.id << "  " << kernel.name << " - "
+              << kernel.description << "\n    shape: " << kernel.shape_requirements;
+    if (kernel.minimum_compute_capability) {
+      std::cout << "; minimum compute capability: "
+                << kernel.minimum_compute_capability;
+    }
+    std::cout << "; pointer alignment: " << kernel.pointer_alignment << " bytes\n";
+  }
+  std::cout << "  auto - deterministic heuristic policy: warp-tiled (10), "
+               "vectorized (6), block-2d (5), then cublas-fp32 (0).\n"
+               "         First supported candidate, not measured tuning.\n";
+}
+
+std::string csv_quote(const std::string &value) {
+  std::string quoted = "\"";
+  for (char character : value) {
+    if (character == '"') quoted += '"';
+    quoted += character;
+  }
+  return quoted + '"';
+}
+
+struct BenchmarkJob {
+  GemmShape shape;
+  KernelSelection selection;
+};
+
 int main(int argc, char **argv) try {
   Options options;
   try {
@@ -167,7 +256,10 @@ int main(int argc, char **argv) try {
     print_usage(argv[0]);
     return EXIT_FAILURE;
   }
-  const int kernel_num = options.kernel;
+  if (options.list_kernels) {
+    list_kernels();
+    return EXIT_SUCCESS;
+  }
 
   int deviceIdx = 0;
   if (const char *device = std::getenv("DEVICE")) {
@@ -183,8 +275,46 @@ int main(int argc, char **argv) try {
         "DEVICE is outside the available CUDA device range");
   }
   cudaCheck(cudaSetDevice(deviceIdx));
+  cudaDeviceProp properties{};
+  cudaCheck(cudaGetDeviceProperties(&properties, deviceIdx));
+  const DeviceCapabilities device{
+      properties.major * 10 + properties.minor, properties.maxThreadsPerBlock,
+      properties.sharedMemPerBlock, properties.maxGridSize[0],
+      properties.maxGridSize[1]};
 
-  printf("Running kernel %d on device %d.\n", kernel_num, deviceIdx);
+  // Preflight every requested workload before handles, events, or buffers.
+  // Explicit shapes fail rather than silently skip or substitute a kernel.
+  std::vector<GemmShape> shapes;
+  if (options.custom_shape) {
+    shapes.push_back(options.shape);
+  } else {
+    for (int size : {128, 256, 512, 1024, 2048, 4096}) {
+      shapes.push_back({size, size, size});
+    }
+  }
+  std::vector<BenchmarkJob> jobs;
+  for (GemmShape shape : shapes) {
+    try {
+      jobs.push_back({shape, select_kernel(options.kernel, shape, device)});
+    } catch (const std::exception &error) {
+      if (options.custom_shape) throw;
+      std::cout << "Skipping kernel " << options.kernel << " ("
+                << options.requested_kernel << ") at size " << shape.m << ": "
+                << error.what() << '\n';
+    }
+  }
+  if (jobs.empty()) {
+    throw std::runtime_error("No runnable benchmark cases for requested kernel " +
+                             options.requested_kernel);
+  }
+
+  if (options.kernel != kAutoKernel) {
+    // Preserve the legacy banner for numeric explicit requests.
+    printf("Running kernel %d on device %d.\n", options.kernel, deviceIdx);
+  } else {
+    std::cout << "Running requested kernel auto on device " << deviceIdx
+              << ".\n";
+  }
   printf("Configuration: warmup=%d, iterations=%d, seed=%u\n", options.warmup,
          options.iterations, options.seed);
 
@@ -200,12 +330,21 @@ int main(int argc, char **argv) try {
   cudaCheck(cudaEventCreate(&beg));
   cudaCheck(cudaEventCreate(&end));
 
-  // cuBLAS FLOPs ceiling is reached at 8192
-  const std::vector<int> sizes = {128, 256, 512, 1024, 2048, 4096};
-  const int max_size = sizes.back();
-  const std::size_t max_elements = static_cast<std::size_t>(max_size) * max_size;
-  const std::size_t max_bytes = sizeof(float) * max_elements;
-  std::cout << "Max size: " << max_size << std::endl;
+  // Preserve one maximum-sized, single-seed baseline for the default sweep.
+  // A custom workload instead allocates its exact MK, KN, and MN counts.
+  const GemmShape allocation_shape = shapes.back();
+  const std::size_t a_elements =
+      static_cast<std::size_t>(allocation_shape.m) * allocation_shape.k;
+  const std::size_t b_elements =
+      static_cast<std::size_t>(allocation_shape.k) * allocation_shape.n;
+  const std::size_t c_elements =
+      static_cast<std::size_t>(allocation_shape.m) * allocation_shape.n;
+  const std::size_t a_bytes = sizeof(float) * a_elements;
+  const std::size_t b_bytes = sizeof(float) * b_elements;
+  const std::size_t c_bytes = sizeof(float) * c_elements;
+  if (!options.custom_shape) {
+    std::cout << "Max size: " << allocation_shape.m << std::endl;
+  }
 
   const float alpha = options.alpha, beta = options.beta;
   float *dA = nullptr, *dB = nullptr, *dC_initial = nullptr, *dC = nullptr,
@@ -219,40 +358,41 @@ int main(int argc, char **argv) try {
                                options.csv_path);
     }
     csv << "kernel,size,average_seconds,gflops,warmup,iters,seed,verified,"
-           "alpha,beta\n";
+           "alpha,beta,m,n,k,kernel_name,requested_kernel,selection_reason\n";
   }
 
   std::srand(options.seed);
-  auto random_matrix = [&]() {
-    std::vector<float> matrix(max_elements);
-    randomize_matrix(matrix.data(), static_cast<int>(max_elements));
+  auto random_matrix = [&](std::size_t elements) {
+    std::vector<float> matrix(elements);
+    randomize_matrix(matrix.data(), static_cast<int>(elements));
     return matrix;
   };
-  const std::vector<float> A = random_matrix();
-  const std::vector<float> B = random_matrix();
+  const std::vector<float> A = random_matrix(a_elements);
+  const std::vector<float> B = random_matrix(b_elements);
   // Keep the initial C immutable and separate from both validation outputs.
-  const std::vector<float> C_initial = random_matrix();
-  std::vector<float> C(max_elements), C_ref(max_elements);
+  const std::vector<float> C_initial = random_matrix(c_elements);
+  std::vector<float> C(c_elements), C_ref(c_elements);
 
-  cudaCheck(cudaMalloc((void **)&dA, max_bytes));
-  cudaCheck(cudaMalloc((void **)&dB, max_bytes));
-  cudaCheck(cudaMalloc((void **)&dC_initial, max_bytes));
-  cudaCheck(cudaMalloc((void **)&dC, max_bytes));
-  cudaCheck(cudaMalloc((void **)&dC_ref, max_bytes));
+  cudaCheck(cudaMalloc((void **)&dA, a_bytes));
+  cudaCheck(cudaMalloc((void **)&dB, b_bytes));
+  cudaCheck(cudaMalloc((void **)&dC_initial, c_bytes));
+  cudaCheck(cudaMalloc((void **)&dC, c_bytes));
+  cudaCheck(cudaMalloc((void **)&dC_ref, c_bytes));
 
-  cudaCheck(cudaMemcpy(dA, A.data(), max_bytes, cudaMemcpyHostToDevice));
-  cudaCheck(cudaMemcpy(dB, B.data(), max_bytes, cudaMemcpyHostToDevice));
+  cudaCheck(cudaMemcpy(dA, A.data(), a_bytes, cudaMemcpyHostToDevice));
+  cudaCheck(cudaMemcpy(dB, B.data(), b_bytes, cudaMemcpyHostToDevice));
   // dC_initial is uploaded once and is never passed to a GEMM as its output.
-  cudaCheck(cudaMemcpy(dC_initial, C_initial.data(), max_bytes,
+  cudaCheck(cudaMemcpy(dC_initial, C_initial.data(), c_bytes,
                        cudaMemcpyHostToDevice));
 
-  for (int size : sizes) {
-    const int m = size, n = size, k = size;
-    if (const char *error = kernel_shape_error(kernel_num, m, n, k)) {
-      std::cout << "Skipping kernel " << kernel_num << " at size " << size
-                << ": " << error << '\n';
-      continue; // Do not emit a timing row or silently substitute another kernel.
-    }
+  for (const BenchmarkJob &job : jobs) {
+    const int m = job.shape.m, n = job.shape.n, k = job.shape.k;
+    const int kernel_num = job.selection.id;
+    const KernelDescriptor &selected = *find_kernel(kernel_num);
+    std::cout << "Requested kernel " << options.requested_kernel
+              << "; selected kernel " << kernel_num << " (" << selected.name
+              << ") for M=" << m << ", N=" << n << ", K=" << k << ": "
+              << job.selection.reason << '\n';
     const std::size_t bytes = sizeof(float) * static_cast<std::size_t>(m) * n;
     auto reset_output = [&](float *output) {
       cudaCheck(cudaMemcpyAsync(output, dC_initial, bytes,
@@ -263,8 +403,12 @@ int main(int argc, char **argv) try {
       cudaCheck(cudaGetLastError());
     };
 
-    std::cout << "dimensions(m=n=k) " << m << ", alpha: " << alpha
-              << ", beta: " << beta << std::endl;
+    if (m == n && n == k) {
+      std::cout << "dimensions(m=n=k) " << m;
+    } else {
+      std::cout << "dimensions(m,n,k) " << m << ',' << n << ',' << k;
+    }
+    std::cout << ", alpha: " << alpha << ", beta: " << beta << std::endl;
     // A larger size must not inherit either output from the preceding size.
     // Validation starts both implementations from the original C as well.
     // cuBLAS is the reference here, not an independently verified result.
@@ -283,7 +427,7 @@ int main(int argc, char **argv) try {
             << "Failed to pass the correctness verification against NVIDIA "
                "cuBLAS."
             << std::endl;
-        if (m <= 128) {
+        if (m <= 128 && n <= 128 && k <= 128) {
           std::cout << " Logging faulty output into " << errLogFile << "\n";
           std::ofstream fs(errLogFile);
           if (!fs) {
@@ -337,17 +481,25 @@ int main(int argc, char **argv) try {
     const double flops = 2.0 * m * n * k;
     const double average_seconds = elapsed_seconds / options.iterations;
     const double gflops = flops * 1e-9 / average_seconds;
-    printf(
-        "Average elapsed time: (%7.6f) s, performance: (%7.1f) GFLOPS. size: "
-        "(%d).\n",
-        average_seconds, gflops, m);
+    if (m == n && n == k) {
+      // Keep the legacy square timing line for existing parsers.
+      printf("Average elapsed time: (%7.6f) s, performance: (%7.1f) GFLOPS. "
+             "size: (%d).\n", average_seconds, gflops, m);
+    } else {
+      printf("Average elapsed time: (%7.6f) s, performance: (%7.1f) GFLOPS. "
+             "dimensions: (m=%d, n=%d, k=%d).\n", average_seconds, gflops, m, n, k);
+    }
     if (csv.is_open()) {
-      csv << kernel_num << ',' << m << ',' << std::fixed << std::setprecision(9)
+      csv << kernel_num << ',';
+      if (m == n && n == k) csv << m;
+      csv << ',' << std::fixed << std::setprecision(9)
           << average_seconds << ',' << std::setprecision(3) << gflops << ','
           << options.warmup << ',' << options.iterations << ',' << options.seed
           << ',' << (verified ? "true" : "false") << ',' << std::defaultfloat
           << std::setprecision(std::numeric_limits<float>::max_digits10) << alpha
-          << ',' << beta << '\n';
+          << ',' << beta << ',' << m << ',' << n << ',' << k << ','
+          << csv_quote(selected.name) << ',' << csv_quote(options.requested_kernel)
+          << ',' << csv_quote(job.selection.reason) << '\n';
       csv.flush();
       if (!csv) {
         throw std::runtime_error("Unable to write CSV output file: " +

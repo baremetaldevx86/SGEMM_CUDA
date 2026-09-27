@@ -3,6 +3,7 @@
 // device discovery reports no device/insufficient driver (CTest SKIP_RETURN_CODE).
 // These numerical tests are not a replacement for separate sanitizer runs.
 #include "../src/runner.cuh"
+#include "../src/kernel_registry.h"
 
 #include <cmath>
 #include <cstdint>
@@ -412,6 +413,66 @@ void test_gpu_shape(Checks &checks, cublasHandle_t handle, int m, int n, int k,
             << sizeof(kScalars) / sizeof(kScalars[0]) << " alpha/beta pairs)\n";
 }
 
+void test_gpu_selection(Checks &checks, cublasHandle_t handle,
+                        const cudaDeviceProp &properties,
+                        std::size_t &case_count) {
+  // The pure registry suite tests synthetic limits; here use the actual CUDA
+  // device and execute exactly the ID returned by host-side selection.
+  const DeviceCapabilities device{
+      properties.major * 10 + properties.minor,
+      properties.maxThreadsPerBlock, properties.sharedMemPerBlock,
+      properties.maxGridSize[0], properties.maxGridSize[1]};
+  struct Fixture { GemmShape shape; int preferred_id; };
+  constexpr Fixture fixtures[] = {
+      {{256, 256, 256}, 10}, // aligned square
+      {{128, 512, 32}, 10},  // aligned rectangular
+      {{128, 256, 8}, 6},    // K excludes warp-tiled
+      {{64, 192, 24}, 5},    // small-tile rectangular
+      {{7, 13, 5}, 0},       // irregular
+      {{1, 1, 1}, 0},        // tiny
+      {{37, 19, 65}, 0}};    // irregular rectangular / odd K
+  for (const auto &fixture : fixtures) {
+    const GemmShape shape = fixture.shape;
+    const auto selected = select_kernel(kAutoKernel, shape, device);
+    const std::string label = shape_label(selected.id, shape.m, shape.n, shape.k);
+    checks.require(selected.id == 10 || selected.id == 6 ||
+                       selected.id == 5 || selected.id == 0,
+                   label + ": selection outside the documented auto policy");
+    checks.require(kernel_support_error(selected.id, shape, device).empty(),
+                   label + ": auto returned an unsupported ID");
+    checks.require(!selected.reason.empty(), label + ": auto reason is empty");
+    // On a device supporting the fixture's preferred choice, it must win.
+    // Resource-limited hardware may legitimately choose a later candidate;
+    // independent synthetic boundary tests cover that behavior exhaustively.
+    if (kernel_support_error(fixture.preferred_id, shape, device).empty()) {
+      checks.require(selected.id == fixture.preferred_id,
+                     label + ": preferred eligible candidate not selected");
+    }
+    const auto repeated = select_kernel(kAutoKernel, shape, device);
+    checks.require(repeated.id == selected.id && repeated.reason == selected.reason,
+                   label + ": nondeterministic selection");
+    const auto explicit_selection = select_kernel(selected.id, shape, device);
+    checks.require(explicit_selection.id == selected.id,
+                   label + ": explicit supported request substituted");
+    std::cout << "AUTO GPU selected " << selected.id << " ("
+              << find_kernel(selected.id)->name << "): " << selected.reason << '\n';
+    test_gpu_shape(checks, handle, shape.m, shape.n, shape.k,
+                   {selected.id}, case_count);
+  }
+  expect_invalid_argument(checks, "GPU explicit selection must not substitute cuBLAS", [&] {
+    (void)select_kernel(10, {7, 13, 5}, device);
+  });
+  constexpr GemmShape invalid_shapes[] = {
+      {0, 128, 32}, {128, -1, 32}, {128, 128, 0}, {65536, 65536, 32}};
+  for (GemmShape shape : invalid_shapes) {
+    expect_invalid_argument(checks, "GPU invalid problem must not auto-fallback", [&] {
+      (void)select_kernel(kAutoKernel, shape, device);
+    });
+  }
+  check_cuda(cudaGetLastError(), "context status after selector rejections");
+  check_cuda(cudaDeviceSynchronize(), "context usable after selector rejections");
+}
+
 bool unavailable(cudaError_t status) {
   return status == cudaErrorNoDevice || status == cudaErrorInsufficientDriver;
 }
@@ -470,6 +531,8 @@ int run_gpu_tests(Checks &checks) {
   for (int k : {16, 32, 48, 80}) {
     test_gpu_shape(checks, handle.get(), 128, 256, k, {11, 12}, case_count);
   }
+  checks.require(case_count == 245, "all 245 baseline numerical cases must remain");
+  test_gpu_selection(checks, handle.get(), properties, case_count);
   check_cuda(cudaDeviceSynchronize(), "final GPU synchronization");
   std::cout << "PASS " << case_count << " CPU-double-reference GPU GEMMs; abs_tol="
             << kAbsoluteTolerance << ", rel_tol=" << kRelativeTolerance << '\n';

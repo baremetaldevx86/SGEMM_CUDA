@@ -1,4 +1,5 @@
 #pragma once
+#include "kernel_registry.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <iosfwd>
@@ -31,12 +32,9 @@ void runCublasBF16(cublasHandle_t handle, int M, int N, int K, float alpha,
 void runCublasTF32(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C);
 
-// Returns nullptr for a supported shape, otherwise a diagnostic. This checks
-// the current fixed runner presets without accessing the GPU. All dimensions
-// must be positive and row-major element counts must fit 32-bit indexing.
-const char *kernel_shape_error(int kernel_num, int m, int n, int k);
-
 // Kernel IDs are stable: 0 selects cuBLAS FP32, and 1-12 select custom kernels.
+// Call select_kernel/kernel_support_error once with the current device before
+// timing; this launch path does not query device capabilities or resolve auto.
 // Throws std::invalid_argument before launch for unsupported shapes or null /
 // misaligned pointers. Allocation sizes and non-aliasing remain caller contracts.
 void run_kernel(int kernel_num, int m, int n, int k, float alpha, float *A,

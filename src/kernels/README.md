@@ -3,11 +3,78 @@
 Kernels 3–12 are **full-tile implementations**, not general-shape GEMM kernels.
 The public `run_kernel()` dispatcher checks the current presets on the host and
 throws `std::invalid_argument` for unsupported shapes or null/misaligned pointers
-before launching. `kernel_shape_error()` exposes the shape check without touching
-CUDA. The benchmark skips unsupported sizes (notably kernel 11 at 128×128),
-prints a reason, and emits no CSV row for the skipped case. It never substitutes
-another kernel under the selected ID. These checks mirror the current fixed
-runner presets and must be updated if those presets change.
+before launching. It launches an actual numeric ID, not the auto selector.
+These checks mirror the current fixed runner presets and must be updated if
+those presets change.
+
+## Host registry and selection
+
+[`../kernel_registry.h`](../kernel_registry.h) provides a CUDA-independent
+registry and preflight policy. `kernel_registry()` lists descriptors and
+`find_kernel()` accepts an existing numeric ID or exact, case-sensitive name.
+The names in ID order are:
+
+| ID | Canonical name |
+|---:|---|
+| 0 | `cublas-fp32` |
+| 1 | `naive` |
+| 2 | `coalesced` |
+| 3 | `shared` |
+| 4 | `block-1d` |
+| 5 | `block-2d` |
+| 6 | `vectorized` |
+| 7 | `bank-linearized` |
+| 8 | `bank-padded` |
+| 9 | `autotuned` |
+| 10 | `warp-tiled` |
+| 11 | `double-buffered` |
+| 12 | `async-double-buffered` |
+
+`sgemm --list-kernels` is a standalone, host-only listing: it needs neither a GPU
+nor CUDA initialization. `sgemm --kernel NAME` and `sgemm NAME` also accept numeric
+IDs and `auto`; unknown selectors fail. `auto` is handled by `select_kernel()`
+using `kAutoKernel`, not by `find_kernel()` or `run_kernel()`.
+
+`problem_shape_error()` requires positive M/N/K and MK, KN, and MN element counts
+within `INT_MAX`. `kernel_shape_error()` checks only shape compatibility, without
+CUDA access. `kernel_support_error()` adds checks against supplied device
+capabilities: declared minimum compute capability, launch threads per block,
+static shared memory, and grid limits. Kernel 12 is gated to CC≥8.0 and has a
+conservative allowance for its shared barrier objects. cuBLAS is eligible for
+all valid problem shapes; its internal resource decisions are not treated as
+custom-kernel launch requirements.
+
+`select_kernel()` returns the actual selected ID and a reason. Explicit IDs must
+pass preflight or fail; they are never silently substituted. Auto is a
+**deterministic first-eligible heuristic, 10 → 6 → 5 → 0**, not runtime tuning or a
+fastest-kernel guarantee. Kernel 9's `autotuned` label is historical: its launch
+preset is fixed. Kernels 11 and 12 are excluded from auto pending further audits,
+but remain available explicitly. Invalid problem dimensions cannot be repaired
+by fallback. There is no retry/fallback after a CUDA launch or execution error.
+
+The CLI queries device capabilities once and does selection outside timing.
+These metadata checks cannot establish that the binary has executable device
+code for the GPU, that pointers and allocations are valid, that the kernels are
+race-free, or that a configuration is performant. CUDA/runtime checks still
+apply; build architecture and toolkit choices still matter.
+
+## Workloads and launch validation
+
+Without dimension flags the benchmark retains its square sweep at 128, 256,
+512, 1024, 2048, and 4096. `--m M --n N --k K` specifies exactly one row-major
+A(M×K) × B(K×N) → C(M×N) workload. All three flags are required together and
+must occur once each; invalid tuples fail. Unsupported explicit single workloads
+fail preflight. The legacy sweep skips unsupported sizes (notably kernel 11 at
+128×128), prints a reason, and emits no timing/CSV row for skipped cases. A sweep
+with no eligible workloads fails. Only selecting `auto` enables policy fallback.
+
+Console output identifies requested and actual selected ID/name and reason.
+CSV retains its first ten columns and appends
+`m,n,k,kernel_name,requested_kernel,selection_reason`: `kernel` is the actual ID,
+`requested_kernel` preserves the original token, and text is CSV-escaped. `size`
+is blank unless M=N=K. Non-cube console timings also show all three dimensions;
+legacy square timing lines retain their format. The plotting tool rejects
+non-cube CSV workloads; see [output details](../../README.md#output-and-plotting).
 
 For callers launching kernel templates directly, their entry guards in `common.cuh` are active even with `NDEBUG`: invalid
 shapes, block/grid dimensions, null pointers, or insufficient pointer alignment
@@ -39,10 +106,11 @@ common header, so no kernel depends on kernel 10 being included first.
 
 ## Deliberately unresolved
 
-- No edge masking, padding, or automatic fallback was added. Partial M/N/K
-  tiles, K=0, and zero-sized GEMMs are rejected by kernels 3–12. Use a suitable
-  general-purpose implementation instead; kernels 1–2 already mask output
-  edges, but their contracts were not changed in this repair.
+- No edge masking or padding was added to tiled kernels. Partial M/N/K tiles
+  are still rejected by kernels 3–12; only the separate `auto` policy may select
+  another eligible implementation. Explicit selection does not fall back.
+  Kernels 1–2 already mask output edges. K=0 and zero-sized GEMMs are rejected
+  for every registry entry, including cuBLAS.
 - Kernels 6–8 perform one vector load per thread. Their existing 64×64
   specializations load only half of each shared tile; kernel 7 also hard-codes
   a layout for BN=128 and TN=8 and can index outside the 64-column shared tile.

@@ -1,8 +1,8 @@
 #pragma once
 
-// CPU-only lifecycle model, NOT a numerical GEMM/CUDA implementation. Each fake
-// device allocation stores one sentinel, but retains its real allocation size.
-// These checks intentionally remain active in Release builds with -DNDEBUG.
+// CPU-only CUDA/runner lifecycle model, NOT numerical GEMM. Registry and
+// selection are linked from the real src/kernel_registry.cpp, never mocked.
+// Invariants intentionally stay active in Release builds with -DNDEBUG.
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -23,24 +23,28 @@ enum cudaMemcpyKind {
   cudaMemcpyDeviceToHost,
   cudaMemcpyDeviceToDevice
 };
+struct cudaDeviceProp {
+  int major = 8;
+  int minor = 6;
+  int maxThreadsPerBlock = 1024;
+  std::size_t sharedMemPerBlock = 48 * 1024;
+  int maxGridSize[3] = {2147483647, 65535, 65535};
+};
 
 namespace benchmark_mock {
 inline void check(bool condition, const char *expression, int line) {
   if (!condition) {
     std::fprintf(stderr, "MOCK invariant failed at runner.cuh:%d: %s\n", line,
                  expression);
-    std::exit(90); // Distinct from the benchmark's expected error exit code.
+    std::exit(90);
   }
 }
 #define MOCK_CHECK(expression) \
   ::benchmark_mock::check(static_cast<bool>(expression), #expression, __LINE__)
 
-constexpr int sizes[] = {128, 256, 512, 1024, 2048, 4096};
-constexpr std::size_t max_elements = 4096u * 4096u;
-constexpr std::size_t max_bytes = sizeof(float) * max_elements;
 struct Shape {
-  int size;
-  bool supported;
+  int m, n, k;
+  int selected_kernel = 0;
   int launches = 0;
   int resets = 0;
   int timed = 0;
@@ -53,23 +57,31 @@ inline int event_creations = 0;
 inline int live_events = 0;
 inline int uploads = 0;
 inline int random_calls = 0;
-inline int selected_kernel = -1;
+inline int allocation_calls = 0;
+inline int device_queries = 0;
+inline int property_queries = 0;
 inline bool launch_checked = true;
 inline bool device_synchronized = true;
 inline bool handle_alive = false;
 inline bool device_selected = false;
 inline float *host_inputs[3] = {};
 inline float *device_inputs[3] = {};
+inline std::size_t input_elements[3] = {};
 inline std::map<void *, std::size_t> allocations;
 inline std::map<float *, std::size_t> ready_outputs;
 inline std::vector<Shape> shapes;
 inline std::string failed_operation;
 inline std::map<std::string, int> failure_calls;
 
+inline int environment_integer(const char *variable, int fallback) {
+  const char *value = std::getenv(variable);
+  return value ? std::stoi(value) : fallback;
+}
 inline bool fail(const char *operation) {
+  // Listing/help and CLI-only failures must not enter any CUDA API at all.
+  MOCK_CHECK(!std::getenv("SGEMM_MOCK_FORBID_CUDA"));
   const int call = ++failure_calls[operation];
   const char *requested = std::getenv("SGEMM_MOCK_FAIL");
-  // A bare operation fails every call; operation:N fails only its Nth call.
   if (requested && (std::string(requested) == operation ||
                     requested == std::string(operation) + ":" + std::to_string(call))) {
     failed_operation = requested;
@@ -79,8 +91,11 @@ inline bool fail(const char *operation) {
 }
 inline bool active_interval() { return timing == Timing::started; }
 inline Shape &shape() {
-  MOCK_CHECK(!shapes.empty() && shapes.back().supported);
+  MOCK_CHECK(!shapes.empty());
   return shapes.back();
+}
+inline std::size_t output_bytes() {
+  return sizeof(float) * static_cast<std::size_t>(shape().m) * shape().n;
 }
 inline void check_baseline() {
   MOCK_CHECK(uploads == 3);
@@ -100,10 +115,10 @@ inline cudaError_t reset(void *destination, const void *source,
   MOCK_CHECK(source == device_inputs[2] && destination != source);
   MOCK_CHECK(destination != device_inputs[0] && destination != device_inputs[1]);
   MOCK_CHECK(allocations.count(destination) == 1);
-  MOCK_CHECK(bytes == sizeof(float) * shape().size * shape().size);
+  MOCK_CHECK(bytes > 0 && bytes <= allocations.at(destination));
+  MOCK_CHECK(bytes <= input_elements[2] * sizeof(float));
   MOCK_CHECK(ready_outputs.emplace(static_cast<float *>(destination), bytes).second);
   *static_cast<float *>(destination) = *static_cast<const float *>(source);
-  ++shape().resets;
   return fail("reset");
 }
 } // namespace benchmark_mock
@@ -116,6 +131,7 @@ inline void cudaCheck(cudaError_t status, const char *file, int line) {
   }
 }
 inline cudaError_t cudaGetDeviceCount(int *count) {
+  ++benchmark_mock::device_queries;
   *count = benchmark_mock::fail("no_devices") ? 0 : 1;
   return benchmark_mock::fail("device_count");
 }
@@ -124,9 +140,22 @@ inline cudaError_t cudaSetDevice(int device) {
   benchmark_mock::device_selected = true;
   return benchmark_mock::fail("set_device");
 }
+inline cudaError_t cudaGetDeviceProperties(cudaDeviceProp *properties, int device) {
+  using namespace benchmark_mock;
+  MOCK_CHECK(device == 0 && ++property_queries == 1);
+  const int cc = environment_integer("SGEMM_MOCK_CC", 86);
+  properties->major = cc / 10;
+  properties->minor = cc % 10;
+  properties->maxThreadsPerBlock = environment_integer("SGEMM_MOCK_THREADS", 1024);
+  properties->sharedMemPerBlock = environment_integer("SGEMM_MOCK_SHARED", 48 * 1024);
+  properties->maxGridSize[0] = environment_integer("SGEMM_MOCK_GRID_X", 2147483647);
+  properties->maxGridSize[1] = environment_integer("SGEMM_MOCK_GRID_Y", 65535);
+  return fail("device_properties");
+}
 inline cublasStatus_t cublasCreate(cublasHandle_t *handle) {
   using namespace benchmark_mock;
-  MOCK_CHECK(device_selected && !handle_alive);
+  MOCK_CHECK(!std::getenv("SGEMM_MOCK_FORBID_RESOURCES"));
+  MOCK_CHECK(device_selected && property_queries == 1 && !handle_alive);
   *handle = &handle_alive;
   handle_alive = true;
   return fail("cublas_create");
@@ -140,20 +169,24 @@ inline cublasStatus_t cublasDestroy(cublasHandle_t handle) {
   MOCK_CHECK(handle == &handle_alive && handle_alive);
   MOCK_CHECK(allocations.empty() && live_events == 0);
   MOCK_CHECK(timing == Timing::idle && launch_checked && ready_outputs.empty());
-  MOCK_CHECK(shapes.size() == 6 && random_calls == 3 && uploads == 3);
+  MOCK_CHECK(!shapes.empty() && random_calls == 3 && uploads == 3);
+  MOCK_CHECK(device_queries == 1 && property_queries == 1);
   int launches = 0, resets = 0, timed = 0;
   for (const Shape &entry : shapes) {
     MOCK_CHECK(entry.launches == entry.resets);
-    if (!entry.supported) {
-      MOCK_CHECK(entry.launches == 0 && entry.verifications == 0);
-    }
-    std::printf("MOCK_SIZE: size=%d supported=%d launches=%d resets=%d timed=%d "
-                "verifications=%d\n", entry.size, entry.supported, entry.launches,
-                entry.resets, entry.timed, entry.verifications);
+    std::printf("MOCK_SHAPE: m=%d n=%d k=%d kernel=%d launches=%d resets=%d "
+                "timed=%d verifications=%d\n", entry.m, entry.n, entry.k,
+                entry.selected_kernel, entry.launches, entry.resets, entry.timed,
+                entry.verifications);
     launches += entry.launches;
     resets += entry.resets;
     timed += entry.timed;
   }
+  std::printf("MOCK_MEMORY: a=%zu b=%zu c=%zu allocations=%d uploads=%d\n",
+              input_elements[0] * sizeof(float), input_elements[1] * sizeof(float),
+              input_elements[2] * sizeof(float), allocation_calls, uploads);
+  std::printf("MOCK_DEVICE: count_queries=%d property_queries=%d\n",
+              device_queries, property_queries);
   std::printf("MOCK_CHECK: launches=%d resets=%d timed=%d transitions=%zu\n",
               launches, resets, timed, shapes.size());
   handle_alive = false;
@@ -161,6 +194,7 @@ inline cublasStatus_t cublasDestroy(cublasHandle_t handle) {
 }
 inline cudaError_t cudaEventCreate(cudaEvent_t *event) {
   using namespace benchmark_mock;
+  MOCK_CHECK(!std::getenv("SGEMM_MOCK_FORBID_RESOURCES"));
   MOCK_CHECK(event_creations < 2);
   *event = new int(event_creations++);
   ++live_events;
@@ -190,7 +224,6 @@ inline cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t begin,
                                        cudaEvent_t end) {
   using namespace benchmark_mock;
   MOCK_CHECK(*begin == 0 && *end == 1 && timing == Timing::synchronized);
-  // Different durations expose incorrect accumulation/averaging across iters.
   *ms = static_cast<float>(shape().timed);
   if (fail("zero_time")) *ms = 0.0f;
   if (fail("negative_time")) *ms = -1.0f;
@@ -207,7 +240,11 @@ inline cudaError_t cudaEventDestroy(cudaEvent_t event) {
 }
 inline cudaError_t cudaMalloc(void **pointer, std::size_t bytes) {
   using namespace benchmark_mock;
-  MOCK_CHECK(bytes == max_bytes && allocations.size() < 5);
+  MOCK_CHECK(!std::getenv("SGEMM_MOCK_FORBID_RESOURCES"));
+  MOCK_CHECK(random_calls == 3 && allocation_calls < 5);
+  const int input = allocation_calls < 2 ? allocation_calls : 2;
+  MOCK_CHECK(bytes == sizeof(float) * input_elements[input]);
+  ++allocation_calls;
   *pointer = new float(std::numeric_limits<float>::quiet_NaN());
   MOCK_CHECK(allocations.emplace(*pointer, bytes).second);
   return fail("malloc");
@@ -232,12 +269,13 @@ inline cudaError_t cudaMemcpy(void *destination, const void *source,
   if (kind == cudaMemcpyDeviceToDevice) return reset(destination, source, bytes);
   if (kind == cudaMemcpyHostToDevice) {
     MOCK_CHECK(uploads < 3 && source == host_inputs[uploads]);
-    MOCK_CHECK(bytes == max_bytes && allocations.count(destination) == 1);
+    MOCK_CHECK(bytes == input_elements[uploads] * sizeof(float));
+    MOCK_CHECK(allocations.count(destination) == 1 && allocations.at(destination) == bytes);
     device_inputs[uploads++] = static_cast<float *>(destination);
   } else {
     MOCK_CHECK(kind == cudaMemcpyDeviceToHost && device_synchronized);
     MOCK_CHECK(allocations.count(const_cast<void *>(source)) == 1);
-    MOCK_CHECK(bytes == sizeof(float) * shape().size * shape().size);
+    MOCK_CHECK(bytes == output_bytes());
     for (int i = 0; i < 3; ++i) MOCK_CHECK(destination != host_inputs[i]);
     check_baseline();
   }
@@ -263,14 +301,17 @@ inline cudaError_t cudaGetLastError() {
 }
 inline void randomize_matrix(float *matrix, int elements) {
   using namespace benchmark_mock;
-  MOCK_CHECK(random_calls < 3 && elements == static_cast<int>(max_elements));
+  MOCK_CHECK(!std::getenv("SGEMM_MOCK_FORBID_RESOURCES"));
+  MOCK_CHECK(random_calls < 3 && elements > 0);
+  input_elements[random_calls] = static_cast<std::size_t>(elements);
   host_inputs[random_calls] = matrix;
   matrix[0] = static_cast<float>(++random_calls);
 }
 inline bool verify_matrix(float *reference, float *output, int elements) {
   using namespace benchmark_mock;
   MOCK_CHECK(device_synchronized && timing == Timing::idle);
-  MOCK_CHECK(reference != output && elements == shape().size * shape().size);
+  MOCK_CHECK(reference != output && elements == shape().m * shape().n);
+  MOCK_CHECK(shape().selected_kernel != 0 && shape().launches == 2);
   check_baseline();
   ++shape().verifications;
   return reference[0] == output[0] && !fail("verify");
@@ -278,36 +319,33 @@ inline bool verify_matrix(float *reference, float *output, int elements) {
 inline void print_matrix(const float *matrix, int, int, std::ofstream &stream) {
   stream << matrix[0] << '\n';
 }
-inline const char *kernel_shape_error(int kernel, int m, int n, int k) {
-  using namespace benchmark_mock;
-  MOCK_CHECK(kernel >= 0 && kernel <= 12 && m == n && n == k);
-  MOCK_CHECK(shapes.size() < 6 && m == sizes[shapes.size()]);
-  MOCK_CHECK(timing == Timing::idle && ready_outputs.empty());
-  MOCK_CHECK(selected_kernel == -1 || selected_kernel == kernel);
-  selected_kernel = kernel;
-  check_baseline();
-  const bool supported = !(kernel == 11 && m == 128) && !fail("skip_all");
-  shapes.push_back({m, supported});
-  return supported ? nullptr : "mock preset requires a larger aligned tile";
-}
 inline void run_kernel(int kernel, int m, int n, int k, float alpha, float *a,
                         float *b, float beta, float *output,
                         cublasHandle_t handle) {
   using namespace benchmark_mock;
   MOCK_CHECK(handle_alive && handle == &handle_alive && launch_checked);
-  MOCK_CHECK(m == shape().size && m == n && n == k);
+  if (shapes.empty() || m != shape().m || n != shape().n || k != shape().k) {
+    shapes.push_back({m, n, k});
+  }
+  MOCK_CHECK(m > 0 && n > 0 && k > 0 && kernel >= 0 && kernel <= 12);
   MOCK_CHECK(a == device_inputs[0] && b == device_inputs[1]);
+  MOCK_CHECK(input_elements[0] >= static_cast<std::size_t>(m) * k);
+  MOCK_CHECK(input_elements[1] >= static_cast<std::size_t>(k) * n);
   MOCK_CHECK(output != device_inputs[2] && allocations.count(output) == 1);
   check_baseline();
   check_scalar(alpha, "SGEMM_MOCK_EXPECT_ALPHA", 0.5f);
   check_scalar(beta, "SGEMM_MOCK_EXPECT_BETA", 3.0f);
-  const bool reference_launch = selected_kernel != 0 && shape().launches == 0;
-  MOCK_CHECK(kernel == (reference_launch ? 0 : selected_kernel));
+  if (kernel != shape().selected_kernel) {
+    MOCK_CHECK(shape().launches == 1 && shape().selected_kernel == 0 && kernel != 0);
+    shape().selected_kernel = kernel;
+  }
+  MOCK_CHECK(ready_outputs.count(output) == 1);
+  MOCK_CHECK(ready_outputs.at(output) == output_bytes());
   MOCK_CHECK(ready_outputs.erase(output) == 1 && output[0] == host_inputs[2][0]);
-  // Deliberately not GEMM: consume the initial C and leave a distinguishable
-  // output so a missing reset cannot silently pass even with a nonzero beta.
+  // Deliberately not GEMM: a missing reset changes the sentinel even for beta!=0.
   output[0] = alpha * static_cast<float>(m + n + k) + beta * output[0];
   ++shape().launches;
+  ++shape().resets;
   launch_checked = false;
   device_synchronized = false;
   if (active_interval()) {

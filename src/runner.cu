@@ -4,7 +4,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
-#include <limits>
 #include <fstream>
 #include <iomanip>
 #include <stdexcept>
@@ -174,14 +173,15 @@ void runCublasTF32(cublasHandle_t handle, int M, int N, int K, float alpha,
 
 void run_sgemm_naive(int M, int N, int K, float alpha, float *A, float *B,
                      float beta, float *C) {
-  dim3 gridDim(CEIL_DIV(M, 32), CEIL_DIV(N, 32));
+  // Arbitrary valid dimensions can approach INT_MAX; avoid M/N + 31 overflow.
+  dim3 gridDim(div_ceil(M, 32), div_ceil(N, 32));
   dim3 blockDim(32, 32);
   sgemm_naive<<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
 void run_sgemm_coalesce(int M, int N, int K, float alpha, float *A, float *B,
                         float beta, float *C) {
-  dim3 gridDim(CEIL_DIV(M, 32), CEIL_DIV(N, 32));
+  dim3 gridDim(div_ceil(M, 32), div_ceil(N, 32));
   dim3 blockDim(32 * 32);
   sgemm_global_mem_coalesce<32>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
@@ -507,109 +507,70 @@ void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
-const char *kernel_shape_error(int kernel_num, int M, int N, int K) {
-  if (kernel_num < 0 || kernel_num > 12) {
-    return "Unknown kernel number (expected 0-12)";
-  }
-  if (M <= 0 || N <= 0 || K <= 0) {
-    return "M, N, and K must be positive";
-  }
-  const auto max_index = std::numeric_limits<int>::max();
-  if (static_cast<std::int64_t>(M) * N > max_index ||
-      static_cast<std::int64_t>(M) * K > max_index ||
-      static_cast<std::int64_t>(K) * N > max_index) {
-    return "Matrix element counts exceed the supported 32-bit indexing range";
-  }
-  // Mirrors the fixed specializations above, not an automatic selector.
-  // Unsupported inputs must not reach a device trap or silently run a different
-  // kernel under the requested kernel ID.
-  switch (kernel_num) {
-  case 0:
-  case 1:
-  case 2:
-    return nullptr;
-  case 3:
-    return M % 32 || N % 32 || K % 32
-               ? "Kernel 3 requires M/N/K multiples of 32" : nullptr;
-  case 4:
-    return M % 64 || N % 64 || K % 8
-               ? "Kernel 4 requires M/N multiples of 64 and K a multiple of 8"
-               : nullptr;
-  case 5: {
-    const int tile = M >= 128 && N >= 128 ? 128 : 64;
-    return M % tile || N % tile || K % 8
-               ? "Kernel 5 requires full 128x128 (or small 64x64) tiles and K a multiple of 8"
-               : nullptr;
-  }
-  case 6:
-  case 7:
-  case 8:
-    return M % 128 || N % 128 || K % 8
-               ? "Kernels 6-8 require M/N multiples of 128 and K a multiple of 8; small tiles are unsupported"
-               : nullptr;
-  case 11:
-    return M % 128 || N % 256 || K % 16
-               ? "Kernel 11 requires M a multiple of 128, N of 256, and K of 16"
-               : nullptr;
-  default: // 9, 10, 12
-    return M % 128 || N % 128 || K % 16
-               ? "Kernels 9/10/12 require M/N multiples of 128 and K a multiple of 16"
-               : nullptr;
-  }
+namespace {
+using KernelLauncher = void (*)(int, int, int, float, float *, float *, float,
+                                float *, cublasHandle_t);
+using CustomLauncher = void (*)(int, int, int, float, float *, float *, float,
+                                float *);
+
+void launch_cublas(int M, int N, int K, float alpha, float *A, float *B,
+                   float beta, float *C, cublasHandle_t handle) {
+  runCublasFP32(handle, M, N, K, alpha, A, B, beta, C);
 }
+
+template <CustomLauncher Launch>
+void launch_custom(int M, int N, int K, float alpha, float *A, float *B,
+                   float beta, float *C, cublasHandle_t) {
+  Launch(M, N, K, alpha, A, B, beta, C);
+}
+
+struct LaunchEntry {
+  int id;
+  KernelLauncher launch;
+};
+// Stable registry IDs, not a selection policy. Auto must already be resolved by
+// the caller so selection/device queries never enter the timed launch path.
+constexpr std::array<LaunchEntry, 13> kLaunchers{{
+    {0, launch_cublas},
+    {1, launch_custom<run_sgemm_naive>},
+    {2, launch_custom<run_sgemm_coalesce>},
+    {3, launch_custom<run_sgemm_shared_mem_block>},
+    {4, launch_custom<runSgemm1DBlocktiling>},
+    {5, launch_custom<runSgemm2DBlocktiling>},
+    {6, launch_custom<runSgemmVectorize>},
+    {7, launch_custom<runSgemmResolveBankConflicts>},
+    {8, launch_custom<runSgemmResolveBankExtraCol>},
+    {9, launch_custom<runSgemmAutotuned>},
+    {10, launch_custom<runSgemmWarptiling>},
+    {11, launch_custom<runSgemmDoubleBuffering>},
+    {12, launch_custom<runSgemmDoubleBuffering2>},
+}};
+constexpr bool launch_ids_match() {
+  for (std::size_t i = 0; i < kLaunchers.size(); ++i) {
+    if (kLaunchers[i].id != static_cast<int>(i)) {
+      return false;
+    }
+  }
+  return true;
+}
+static_assert(launch_ids_match(), "Launch table must be indexed by stable registry IDs");
+// kernel_registry.cpp reserves 128 bytes beyond kernel 12's float arrays.
+// Guard its conservative estimate against an incompatible CUDA barrier layout.
+using BlockBarrier = cuda::barrier<cuda::thread_scope::thread_scope_block>;
+static_assert(sizeof(BlockBarrier) <= 64 && alignof(BlockBarrier) <= 16,
+              "Update kernel 12 shared-memory metadata for this CUDA barrier layout");
+} // namespace
 
 void run_kernel(int kernel_num, int M, int N, int K, float alpha, float *A,
                 float *B, float beta, float *C, cublasHandle_t handle) {
   if (const char *error = kernel_shape_error(kernel_num, M, N, K)) {
     throw std::invalid_argument(error);
   }
-  const std::uintptr_t alignment = kernel_num >= 6 ? sizeof(float4) : alignof(float);
+  const std::size_t alignment = find_kernel(kernel_num)->pointer_alignment;
   if (!A || !B || !C || reinterpret_cast<std::uintptr_t>(A) % alignment ||
       reinterpret_cast<std::uintptr_t>(B) % alignment ||
       reinterpret_cast<std::uintptr_t>(C) % alignment) {
     throw std::invalid_argument("GEMM requires non-null, suitably aligned A/B/C pointers");
   }
-  switch (kernel_num) {
-  case 0:
-    runCublasFP32(handle, M, N, K, alpha, A, B, beta, C);
-    break;
-  case 1:
-    run_sgemm_naive(M, N, K, alpha, A, B, beta, C);
-    break;
-  case 2:
-    run_sgemm_coalesce(M, N, K, alpha, A, B, beta, C);
-    break;
-  case 3:
-    run_sgemm_shared_mem_block(M, N, K, alpha, A, B, beta, C);
-    break;
-  case 4:
-    runSgemm1DBlocktiling(M, N, K, alpha, A, B, beta, C);
-    break;
-  case 5:
-    runSgemm2DBlocktiling(M, N, K, alpha, A, B, beta, C);
-    break;
-  case 6:
-    runSgemmVectorize(M, N, K, alpha, A, B, beta, C);
-    break;
-  case 7:
-    runSgemmResolveBankConflicts(M, N, K, alpha, A, B, beta, C);
-    break;
-  case 8:
-    runSgemmResolveBankExtraCol(M, N, K, alpha, A, B, beta, C);
-    break;
-  case 9:
-    runSgemmAutotuned(M, N, K, alpha, A, B, beta, C);
-    break;
-  case 10:
-    runSgemmWarptiling(M, N, K, alpha, A, B, beta, C);
-    break;
-  case 11:
-    runSgemmDoubleBuffering(M, N, K, alpha, A, B, beta, C);
-    break;
-  case 12:
-    runSgemmDoubleBuffering2(M, N, K, alpha, A, B, beta, C);
-    break;
-  default:
-    throw std::invalid_argument("Unknown kernel number");
-  }
+  kLaunchers[kernel_num].launch(M, N, K, alpha, A, B, beta, C, handle);
 }
