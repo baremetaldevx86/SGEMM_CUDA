@@ -7,8 +7,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
-const int WARPSIZE = 32; // warpSize is not constexpr
+#include "common.cuh"
 
 namespace wt {
 template <const int BM, const int BN, const int BK, const int rowStrideA,
@@ -102,6 +101,10 @@ template <const int BM, const int BN, const int BK, const int WM, const int WN,
 __global__ void __launch_bounds__(NUM_THREADS)
     sgemmWarptiling(int M, int N, int K, float alpha, float *A, float *B,
                     float beta, float *C) {
+  sgemm_detail::validate_warp_tiling<BM, BN, BK, WM, WN, WNITER, TM, TN,
+                                     NUM_THREADS>();
+  sgemm_detail::require_tiled_launch<BM, BN, BK, NUM_THREADS, true>(
+      M, N, K, A, B, C);
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
 
@@ -122,7 +125,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
   // allocate space for the current blocktile in SMEM
   __shared__ float As[BM * BK];
-  __shared__ float Bs[BK * BN];
+  __shared__ __align__(16) float Bs[BK * BN];
 
   // Move blocktile to beginning of A's row and B's column
   A += cRow * BM * K;

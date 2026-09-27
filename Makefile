@@ -1,34 +1,43 @@
 .PHONY: all build debug clean profile bench cuobjdump
 
-CMAKE := cmake
+CMAKE ?= cmake
+CUOBJDUMP ?= cuobjdump
+NCU ?= ncu
 
-BUILD_DIR := build
-BENCHMARK_DIR := benchmark_results
+BUILD_DIR ?= build
+BENCHMARK_DIR ?= benchmark_results
+CMAKE_ARGS ?=
+# Example: make CUDA_ARCHITECTURES='80;86'. Leave unset to use CMake's default
+# (or the architecture already selected in the build directory's cache).
+CUDA_ARCHITECTURES ?=
+CMAKE_ARCH_ARGS = $(if $(strip $(CUDA_ARCHITECTURES)),-DCMAKE_CUDA_ARCHITECTURES="$(CUDA_ARCHITECTURES)")
 
 all: build
 
 build:
-	@mkdir -p $(BUILD_DIR)
-	@cd $(BUILD_DIR) && $(CMAKE) -DCMAKE_BUILD_TYPE=Release ..
-	@$(MAKE) -C $(BUILD_DIR)
+	@$(CMAKE) -S . -B "$(BUILD_DIR)" -DCMAKE_BUILD_TYPE=Release $(CMAKE_ARCH_ARGS) $(CMAKE_ARGS)
+	@$(CMAKE) --build "$(BUILD_DIR)" --config Release
 
 debug:
-	@mkdir -p $(BUILD_DIR)
-	@cd $(BUILD_DIR) && $(CMAKE) -DCMAKE_BUILD_TYPE=Debug ..
-	@$(MAKE) -C $(BUILD_DIR)
+	@$(CMAKE) -S . -B "$(BUILD_DIR)" -DCMAKE_BUILD_TYPE=Debug $(CMAKE_ARCH_ARGS) $(CMAKE_ARGS)
+	@$(CMAKE) --build "$(BUILD_DIR)" --config Debug
 
 clean:
-	@rm -rf $(BUILD_DIR)
+	@rm -rf "$(BUILD_DIR)"
 
-FUNCTION := $$(cuobjdump -symbols build/sgemm | grep -i Warptiling | awk '{print $$NF}')
+# Dump all compiled architectures by default; optionally select one with
+# make cuobjdump CUOBJDUMP_ARCH=sm_80 CUDA_ARCHITECTURES=80.
+CUOBJDUMP_ARCH ?=
+FUNCTION ?= $$($(CUOBJDUMP) --dump-elf-symbols "$(BUILD_DIR)/sgemm" | awk 'tolower($$0) ~ /warptiling/ {print $$NF}' | sort -u | paste -sd, -)
 
 cuobjdump: build
-	@cuobjdump -arch sm_86 -sass -fun $(FUNCTION) build/sgemm | c++filt > build/cuobjdump.sass
-	@cuobjdump -arch sm_86 -ptx -fun $(FUNCTION) build/sgemm | c++filt > build/cuobjdump.ptx
+	@$(CUOBJDUMP) $(if $(CUOBJDUMP_ARCH),--gpu-architecture $(CUOBJDUMP_ARCH)) --dump-sass --function "$(FUNCTION)" "$(BUILD_DIR)/sgemm" | c++filt > "$(BUILD_DIR)/cuobjdump.sass"
+	@$(CUOBJDUMP) $(if $(CUOBJDUMP_ARCH),--gpu-architecture $(CUOBJDUMP_ARCH)) --dump-ptx --function "$(FUNCTION)" "$(BUILD_DIR)/sgemm" | c++filt > "$(BUILD_DIR)/cuobjdump.ptx"
 
 # Usage: make profile KERNEL=<integer> PREFIX=<optional string>
 profile: build
-	@ncu --set full --export $(BENCHMARK_DIR)/$(PREFIX)kernel_$(KERNEL) --force-overwrite $(BUILD_DIR)/sgemm $(KERNEL)
+	@mkdir -p "$(BENCHMARK_DIR)"
+	@$(NCU) --set full --export "$(BENCHMARK_DIR)/$(PREFIX)kernel_$(KERNEL)" --force-overwrite "$(BUILD_DIR)/sgemm" $(KERNEL)
 
 bench: build
-	@bash gen_benchmark_results.sh
+	@SGEMM_BIN="$(BUILD_DIR)/sgemm" bash gen_benchmark_results.sh

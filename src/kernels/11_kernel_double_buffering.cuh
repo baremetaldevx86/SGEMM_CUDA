@@ -7,7 +7,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+#include "common.cuh"
 
 namespace db {
 
@@ -84,6 +84,12 @@ __global__ void __launch_bounds__(NUM_THREADS)
     sgemmDoubleBuffering(const int M, const int N, const int K,
                          const float alpha, float *A, float *B, float beta,
                          float *C) {
+  static_assert(NUM_THREADS % (2 * WARPSIZE) == 0,
+                "Double buffering requires two whole-warp thread groups");
+  sgemm_detail::validate_warp_tiling<BM, BN, BK, WM, WN, WNITER, TM, TN,
+                                     NUM_THREADS, NUM_THREADS / 2>();
+  sgemm_detail::require_tiled_launch<BM, BN, BK, NUM_THREADS, true>(
+      M, N, K, A, B, C);
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
 
@@ -104,7 +110,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
   // allocate space for the current blocktile in SMEM
   __shared__ float As[2 * BM * BK];
-  __shared__ float Bs[2 * BK * BN];
+  __shared__ __align__(16) float Bs[2 * BK * BN];
 
   // setup double buffering split
   bool doubleBufferIdx = threadIdx.x >= (NUM_THREADS / 2);

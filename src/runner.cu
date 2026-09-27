@@ -1,9 +1,25 @@
-#include "kernels.cuh"
 #include "runner.cuh"
+#include "kernels.cuh"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <limits>
 #include <fstream>
 #include <iomanip>
+#include <stdexcept>
+#include <sys/time.h>
+
+namespace {
+void checkCublasStatus(cublasStatus_t status, const char *file, int line) {
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    std::fprintf(stderr, "[cuBLAS ERROR] at file %s:%d: %s (%d): %s\n", file,
+                 line, cublasGetStatusName(status), static_cast<int>(status),
+                 cublasGetStatusString(status));
+    std::exit(EXIT_FAILURE);
+  }
+}
+} // namespace
 
 float get_sec() {
   struct timeval time;
@@ -11,23 +27,25 @@ float get_sec() {
   return (1e6 * time.tv_sec + time.tv_usec);
 }
 
+float get_current_sec() { return get_sec(); }
+
 float cpu_elapsed_time(float &beg, float &end) { return 1.0e-6 * (end - beg); }
 
 void cudaCheck(cudaError_t error, const char *file, int line) {
   if (error != cudaSuccess) {
-    printf("[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
-           cudaGetErrorString(error));
-    exit(EXIT_FAILURE);
+    std::fprintf(stderr, "[CUDA ERROR] at file %s:%d:\n%s\n", file, line,
+                 cudaGetErrorString(error));
+    std::exit(EXIT_FAILURE);
   }
-};
+}
 
 void CudaDeviceInfo() {
   int deviceId;
 
-  cudaGetDevice(&deviceId);
+  cudaCheck(cudaGetDevice(&deviceId), __FILE__, __LINE__);
 
   cudaDeviceProp props{};
-  cudaGetDeviceProperties(&props, deviceId);
+  cudaCheck(cudaGetDeviceProperties(&props, deviceId), __FILE__, __LINE__);
 
   printf("Device ID: %d\n\
     Name: %s\n\
@@ -75,11 +93,13 @@ void zero_init_matrix(float *mat, int N) {
 }
 
 void copy_matrix(const float *src, float *dest, int N) {
-  int i;
-  for (i = 0; src + i && dest + i && i < N; i++)
-    *(dest + i) = *(src + i);
-  if (i != N)
-    printf("copy failed at %d while there are %d elements in total.\n", i, N);
+  if (N < 0 || (N > 0 && (src == nullptr || dest == nullptr))) {
+    throw std::invalid_argument("copy_matrix requires a non-negative size and "
+                                "non-null buffers for a non-empty copy");
+  }
+  for (int i = 0; i < N; ++i) {
+    dest[i] = src[i];
+  }
 }
 
 void print_matrix(const float *A, int M, int N, std::ofstream &fs) {
@@ -104,8 +124,8 @@ bool verify_matrix(float *matRef, float *matOut, int N) {
   double diff = 0.0;
   int i;
   for (i = 0; i < N; i++) {
-    diff = std::fabs(matRef[i] - matOut[i]);
-    if (isnan(diff) || diff > 0.01) {
+    diff = std::fabs(static_cast<double>(matRef[i]) - matOut[i]);
+    if (!std::isfinite(diff) || diff > 0.01) {
       printf("Divergence! Should %5.2f, Is %5.2f (Diff %5.2f) at %d\n",
              matRef[i], matOut[i], diff, i);
       return false;
@@ -121,30 +141,35 @@ int div_ceil(int numerator, int denominator) {
 
 void runCublasFP32(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C) {
-  // cuBLAS uses column-major order. So we change the order of our row-major A &
-  // B, since (B^T*A^T)^T = (A*B)
-  // This runs cuBLAS in full fp32 mode
-  cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_32F,
-               N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
-               CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  // cuBLAS uses column-major order. Reverse our row-major operands because
+  // (B^T * A^T)^T = A * B. Inputs, output, and computation use FP32.
+  checkCublasStatus(
+      cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B,
+                   CUDA_R_32F, N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N,
+                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+      __FILE__, __LINE__);
 }
 
 void runCublasBF16(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C) {
-  // This runs cuBLAS with mixed precision (performing the mul with operands
-  // downcast to bf16), which is ~4x faster
-  cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_32F,
-               N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N,
-               CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  // Permit BF16 multiplication with FP32 accumulation and FP32 input/output
+  // buffers. Performance and availability depend on the GPU and cuBLAS.
+  checkCublasStatus(
+      cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B,
+                   CUDA_R_32F, N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N,
+                   CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+      __FILE__, __LINE__);
 }
 
 void runCublasTF32(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C) {
-  // This runs cuBLAS with mixed precision (performing the mul with operands
-  // downcast to bf16), which is ~4x faster
-  cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_32F,
-               N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N,
-               CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  // Permit TF32 (not BF16) multiplication with FP32 accumulation and FP32
+  // input/output buffers. Performance and availability are hardware-dependent.
+  checkCublasStatus(
+      cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B,
+                   CUDA_R_32F, N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N,
+                   CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+      __FILE__, __LINE__);
 }
 
 void run_sgemm_naive(int M, int N, int K, float alpha, float *A, float *B,
@@ -166,12 +191,13 @@ void run_sgemm_shared_mem_block(int M, int N, int K, float alpha, float *A,
                                 float *B, float beta, float *C) {
   dim3 gridDim(CEIL_DIV(M, 32), CEIL_DIV(N, 32));
   dim3 blockDim(32 * 32);
-  // L1 cache becomes useless, since we access GMEM only via SMEM, so we carve
-  // out all of L1 to SMEM. This doesn't currently make a difference, since
-  // occupancy is limited by reg and thread count, but it's good to do anyway.
-  cudaFuncSetAttribute(sgemm_shared_mem_block<32>,
-                       cudaFuncAttributePreferredSharedMemoryCarveout,
-                       cudaSharedmemCarveoutMaxShared);
+  // Prefer shared memory over L1 where the hardware supports this hint.
+  // Reapply it for the current device/context rather than caching process-wide:
+  // callers may switch devices or reset their CUDA context between launches.
+  cudaCheck(cudaFuncSetAttribute(sgemm_shared_mem_block<32>,
+                                  cudaFuncAttributePreferredSharedMemoryCarveout,
+                                  cudaSharedmemCarveoutMaxShared),
+            __FILE__, __LINE__);
   sgemm_shared_mem_block<32>
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
@@ -225,14 +251,8 @@ void runSgemmVectorize(int M, int N, int K, float alpha, float *A, float *B,
     sgemmVectorize<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   } else {
-    // this is a hacky solution to the underlying problem
-    // of not having proper bounds checking in the kernel
-    const uint BM = 64;
-    const uint BN = 64;
-    dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
-    dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmVectorize<BM, BN, BK, TM, TN>
-        <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    // The old 64x64 specialization loaded only half its shared-memory tile.
+    throw std::invalid_argument("Kernel 6 does not support the 64x64 tile path");
   }
 }
 
@@ -249,14 +269,8 @@ void runSgemmResolveBankConflicts(int M, int N, int K, float alpha, float *A,
     sgemmResolveBankConflicts<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   } else {
-    // this is a hacky solution to the underlying problem
-    // of not having proper bounds checking in the kernel
-    const uint BM = 64;
-    const uint BN = 64;
-    dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
-    dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmResolveBankConflicts<BM, BN, BK, TM, TN>
-        <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    // This shared-memory layout also hard-codes a 128-column tile.
+    throw std::invalid_argument("Kernel 7 does not support the 64x64 tile path");
   }
 }
 
@@ -273,14 +287,8 @@ void runSgemmResolveBankExtraCol(int M, int N, int K, float alpha, float *A,
     sgemmResolveBankExtraCol<BM, BN, BK, TM, TN>
         <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
   } else {
-    // this is a hacky solution to the underlying problem
-    // of not having proper bounds checking in the kernel
-    const uint BM = 64;
-    const uint BN = 64;
-    dim3 gridDim(CEIL_DIV(N, BN), CEIL_DIV(M, BM));
-    dim3 blockDim((BM * BN) / (TM * TN));
-    sgemmResolveBankExtraCol<BM, BN, BK, TM, TN>
-        <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
+    // The old 64x64 specialization loaded only half its shared-memory tile.
+    throw std::invalid_argument("Kernel 8 does not support the 64x64 tile path");
   }
 }
 
@@ -499,8 +507,68 @@ void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
       <<<gridDim, blockDim>>>(M, N, K, alpha, A, B, beta, C);
 }
 
+const char *kernel_shape_error(int kernel_num, int M, int N, int K) {
+  if (kernel_num < 0 || kernel_num > 12) {
+    return "Unknown kernel number (expected 0-12)";
+  }
+  if (M <= 0 || N <= 0 || K <= 0) {
+    return "M, N, and K must be positive";
+  }
+  const auto max_index = std::numeric_limits<int>::max();
+  if (static_cast<std::int64_t>(M) * N > max_index ||
+      static_cast<std::int64_t>(M) * K > max_index ||
+      static_cast<std::int64_t>(K) * N > max_index) {
+    return "Matrix element counts exceed the supported 32-bit indexing range";
+  }
+  // Mirrors the fixed specializations above, not an automatic selector.
+  // Unsupported inputs must not reach a device trap or silently run a different
+  // kernel under the requested kernel ID.
+  switch (kernel_num) {
+  case 0:
+  case 1:
+  case 2:
+    return nullptr;
+  case 3:
+    return M % 32 || N % 32 || K % 32
+               ? "Kernel 3 requires M/N/K multiples of 32" : nullptr;
+  case 4:
+    return M % 64 || N % 64 || K % 8
+               ? "Kernel 4 requires M/N multiples of 64 and K a multiple of 8"
+               : nullptr;
+  case 5: {
+    const int tile = M >= 128 && N >= 128 ? 128 : 64;
+    return M % tile || N % tile || K % 8
+               ? "Kernel 5 requires full 128x128 (or small 64x64) tiles and K a multiple of 8"
+               : nullptr;
+  }
+  case 6:
+  case 7:
+  case 8:
+    return M % 128 || N % 128 || K % 8
+               ? "Kernels 6-8 require M/N multiples of 128 and K a multiple of 8; small tiles are unsupported"
+               : nullptr;
+  case 11:
+    return M % 128 || N % 256 || K % 16
+               ? "Kernel 11 requires M a multiple of 128, N of 256, and K of 16"
+               : nullptr;
+  default: // 9, 10, 12
+    return M % 128 || N % 128 || K % 16
+               ? "Kernels 9/10/12 require M/N multiples of 128 and K a multiple of 16"
+               : nullptr;
+  }
+}
+
 void run_kernel(int kernel_num, int M, int N, int K, float alpha, float *A,
                 float *B, float beta, float *C, cublasHandle_t handle) {
+  if (const char *error = kernel_shape_error(kernel_num, M, N, K)) {
+    throw std::invalid_argument(error);
+  }
+  const std::uintptr_t alignment = kernel_num >= 6 ? sizeof(float4) : alignof(float);
+  if (!A || !B || !C || reinterpret_cast<std::uintptr_t>(A) % alignment ||
+      reinterpret_cast<std::uintptr_t>(B) % alignment ||
+      reinterpret_cast<std::uintptr_t>(C) % alignment) {
+    throw std::invalid_argument("GEMM requires non-null, suitably aligned A/B/C pointers");
+  }
   switch (kernel_num) {
   case 0:
     runCublasFP32(handle, M, N, K, alpha, A, B, beta, C);

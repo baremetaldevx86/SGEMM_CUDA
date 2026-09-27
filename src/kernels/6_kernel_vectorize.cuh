@@ -7,11 +7,14 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+#include "common.cuh"
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void sgemmVectorize(int M, int N, int K, float alpha, float *A,
                                float *B, float beta, float *C) {
+  sgemm_detail::require_single_vector_load<BM, BN, BK, TM, TN>();
+  sgemm_detail::require_tiled_launch<BM, BN, BK, (BM * BN) / (TM * TN), true>(
+      M, N, K, A, B, C);
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
 
@@ -21,7 +24,7 @@ __global__ void sgemmVectorize(int M, int N, int K, float alpha, float *A,
 
   // allocate space for the current blocktile in smem
   __shared__ float As[BM * BK];
-  __shared__ float Bs[BK * BN];
+  __shared__ __align__(16) float Bs[BK * BN];
 
   // Move blocktile to beginning of A's row and B's column
   A += cRow * BM * K;

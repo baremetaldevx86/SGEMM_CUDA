@@ -7,12 +7,17 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+#include "common.cuh"
 
 template <const int BM, const int BN, const int BK, const int TM>
 __global__ void sgemm1DBlocktiling(int M, int N, int K, float alpha,
                                    const float *A, const float *B, float beta,
                                    float *C) {
+  static_assert(TM > 0 && BM % TM == 0, "TM must divide BM");
+  static_assert(BM * BK == (BM * BN) / TM && BN * BK == (BM * BN) / TM,
+                "Each thread must load exactly one element of each tile");
+  sgemm_detail::require_tiled_launch<BM, BN, BK, (BM * BN) / TM>(
+      M, N, K, A, B, C);
   // If we flip x and y here we get ~30% less performance for large matrices.
   // The current, 30% faster configuration ensures that blocks with sequential
   // blockIDs access columns of B sequentially, while sharing the same row of A.

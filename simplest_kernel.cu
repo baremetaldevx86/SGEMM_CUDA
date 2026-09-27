@@ -1,46 +1,67 @@
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <iostream>
-#include <vector>
 
-__global__ void kernel(uint *A, uint *B, int row) {
-  auto x = threadIdx.x / 4;
-  auto y = threadIdx.x % 4;
-  A[x * row + y] = x;
-  B[x * row + y] = y;
+#define CUDA_CHECK(call)                                                       \
+  do {                                                                         \
+    const cudaError_t error = (call);                                           \
+    if (error != cudaSuccess) {                                                \
+      std::fprintf(stderr, "%s:%d: %s failed: %s\n", __FILE__, __LINE__, #call,  \
+                   cudaGetErrorString(error));                                 \
+      std::exit(EXIT_FAILURE);                                                 \
+    }                                                                          \
+  } while (0)
+
+__global__ void kernel(unsigned int *A, unsigned int *B, unsigned int size) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < size * size) {
+    A[index] = index / size;
+    B[index] = index % size;
+  }
 }
 
-int main(int argc, char **argv) {
-  uint *Xs, *Ys;
-  uint *Xs_d, *Ys_d;
+int main() {
+  unsigned int *Xs, *Ys;
+  unsigned int *Xs_d, *Ys_d;
 
-  uint SIZE = 4;
+  constexpr unsigned int SIZE = 4;
+  constexpr size_t bytes = SIZE * SIZE * sizeof(unsigned int);
 
-  Xs = (uint *)malloc(SIZE * SIZE * sizeof(uint));
-  Ys = (uint *)malloc(SIZE * SIZE * sizeof(uint));
+  Xs = (unsigned int *)malloc(bytes);
+  Ys = (unsigned int *)malloc(bytes);
+  if (Xs == nullptr || Ys == nullptr) {
+    std::fprintf(stderr, "Failed to allocate host matrices\n");
+    free(Xs);
+    free(Ys);
+    return EXIT_FAILURE;
+  }
 
-  cudaMalloc((void **)&Xs_d, SIZE * SIZE * sizeof(uint));
-  cudaMalloc((void **)&Ys_d, SIZE * SIZE * sizeof(uint));
+  CUDA_CHECK(cudaMalloc((void **)&Xs_d, bytes));
+  CUDA_CHECK(cudaMalloc((void **)&Ys_d, bytes));
 
   dim3 grid_size(1, 1, 1);
-  dim3 block_size(4 * 4);
+  dim3 block_size(SIZE * SIZE);
 
-  kernel<<<grid_size, block_size>>>(Xs_d, Ys_d, 4);
+  // Every element is written by the kernel; no initial device contents are read.
+  kernel<<<grid_size, block_size>>>(Xs_d, Ys_d, SIZE);
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
 
-  cudaMemcpy(Xs, Xs_d, SIZE * SIZE * sizeof(uint), cudaMemcpyDeviceToHost);
-  cudaMemcpy(Ys, Ys_d, SIZE * SIZE * sizeof(uint), cudaMemcpyDeviceToHost);
+  CUDA_CHECK(cudaMemcpy(Xs, Xs_d, bytes, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(Ys, Ys_d, bytes, cudaMemcpyDeviceToHost));
 
-  cudaDeviceSynchronize();
-
-  for (int row = 0; row < SIZE; ++row) {
-    for (int col = 0; col < SIZE; ++col) {
+  for (unsigned int row = 0; row < SIZE; ++row) {
+    for (unsigned int col = 0; col < SIZE; ++col) {
       std::cout << "[" << Xs[row * SIZE + col] << "|" << Ys[row * SIZE + col]
                 << "] ";
     }
     std::cout << "\n";
   }
 
-  cudaFree(Xs_d);
-  cudaFree(Ys_d);
+  CUDA_CHECK(cudaFree(Xs_d));
+  CUDA_CHECK(cudaFree(Ys_d));
   free(Xs);
   free(Ys);
+  return EXIT_SUCCESS;
 }

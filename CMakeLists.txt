@@ -1,36 +1,67 @@
 cmake_minimum_required(VERSION 3.19)
+
+# Keep the original Ampere default, but honor -DCMAKE_CUDA_ARCHITECTURES and
+# CUDAARCHS. CMake initializes every CUDA target from this variable.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
+    set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures to build")
+endif()
+
 project(NVIDIA_SGEMM_PRACTICE LANGUAGES CXX CUDA)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(CUDA REQUIRED)
-
-# ensure cuda is available
-include(CheckLanguage)
-check_language(CUDA)
+# CUDA is already enabled as a language; use the maintained toolkit package
+# rather than the deprecated FindCUDA module.
+find_package(CUDAToolkit 12 REQUIRED)
 
 set(CMAKE_CXX_STANDARD 20)
-set(CUDA_COMPUTE_CAPABILITY 86)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# in debug mode, add debug symbols to device code
-# this disables most optimizations and kills performance
-add_compile_options("$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-G;-src-in-ptx>")
-# add_compile_options("--ptxas-options=-v")
+add_executable(sgemm sgemm.cu src/runner.cu)
+target_include_directories(sgemm PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(sgemm PRIVATE CUDA::cudart CUDA::cublas)
 
-# Configure header file search paths
-include_directories(${CUDA_INCLUDE_DIRS})
-include_directories(${PROJECT_SOURCE_DIR}/src)
-# Configure the source file path to be compiled
-aux_source_directory(${PROJECT_SOURCE_DIR}/src SRC)
-
-# generate executable
-add_executable(sgemm sgemm.cu ${SRC})
-set_target_properties(sgemm PROPERTIES CUDA_ARCHITECTURES ${CUDA_COMPUTE_CAPABILITY})
-target_link_libraries(sgemm ${CUDA_LIBRARIES} ${CUDA_CUBLAS_LIBRARIES})
-
-add_executable(cuBLAS_sgemm cuBLAS_sgemm.cu )
-set_target_properties(sgemm PROPERTIES CUDA_ARCHITECTURES ${CUDA_COMPUTE_CAPABILITY})
-target_link_libraries(cuBLAS_sgemm ${CUDA_LIBRARIES} ${CUDA_CUBLAS_LIBRARIES})
+add_executable(cuBLAS_sgemm cuBLAS_sgemm.cu)
+target_link_libraries(cuBLAS_sgemm PRIVATE CUDA::cudart CUDA::cublas)
 
 add_executable(simplest_kernel simplest_kernel.cu)
-set_target_properties(sgemm PROPERTIES CUDA_ARCHITECTURES ${CUDA_COMPUTE_CAPABILITY})
-target_link_libraries(simplest_kernel ${CUDA_LIBRARIES})
+target_link_libraries(simplest_kernel PRIVATE CUDA::cudart)
+
+include(CTest)
+set(cuda_targets sgemm cuBLAS_sgemm simplest_kernel)
+if(BUILD_TESTING)
+    add_executable(sgemm_runner_tests tests/runner_tests.cu src/runner.cu)
+    target_include_directories(sgemm_runner_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(sgemm_runner_tests PRIVATE CUDA::cudart CUDA::cublas)
+    list(APPEND cuda_targets sgemm_runner_tests)
+    add_test(NAME runner_host COMMAND sgemm_runner_tests --host)
+    set_tests_properties(runner_host PROPERTIES LABELS "cpu")
+    add_test(NAME runner_gpu COMMAND sgemm_runner_tests --gpu)
+    set_tests_properties(runner_gpu PROPERTIES
+        SKIP_RETURN_CODE 77 LABELS "gpu" RESOURCE_LOCK cuda_device_0 TIMEOUT 180)
+
+    # Compile the actual CLI against a CPU-only runner model. CUDA headers and
+    # libraries must not be added to this target's includes or link interface.
+    add_executable(sgemm_benchmark_mock tests/benchmark_mock/benchmark_main.cpp)
+    target_include_directories(sgemm_benchmark_mock PRIVATE
+        ${PROJECT_SOURCE_DIR}/tests/benchmark_mock)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME benchmark_mock COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/benchmark_mock/test_benchmark.py
+            $<TARGET_FILE:sgemm_benchmark_mock>)
+        set_tests_properties(benchmark_mock PROPERTIES LABELS "cpu" TIMEOUT 180)
+        add_test(NAME bank_calc COMMAND ${Python3_EXECUTABLE}
+            ${PROJECT_SOURCE_DIR}/tests/test_bank_calc.py)
+        set_tests_properties(bank_calc PROPERTIES LABELS "cpu" TIMEOUT 30)
+    else()
+        message(WARNING "Python3 not found: benchmark lifecycle and bank calculator tests are unavailable")
+    endif()
+endif()
+
+foreach(target IN LISTS cuda_targets)
+    # Device debugging disables most optimizations and reduces performance.
+    # Avoid -src-in-ptx: CUDA 12.4 can produce invalid PTX with source interleaving.
+    target_compile_options(${target} PRIVATE
+        "$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-G>")
+endforeach()

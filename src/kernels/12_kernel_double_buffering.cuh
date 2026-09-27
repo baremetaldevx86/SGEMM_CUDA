@@ -9,7 +9,7 @@
 #include <cuda/barrier>
 #include <cuda_runtime.h>
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+#include "common.cuh"
 
 namespace {
 template <const int BM, const int BN, const int BK, const int rowStrideA,
@@ -104,6 +104,10 @@ template <const int BM, const int BN, const int BK, const int WM, const int WN,
 __global__ void __launch_bounds__(NUM_THREADS)
     runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
                              float *B, float beta, float *C) {
+  sgemm_detail::validate_warp_tiling<BM, BN, BK, WM, WN, WNITER, TM, TN,
+                                     NUM_THREADS>();
+  sgemm_detail::require_tiled_launch<BM, BN, BK, NUM_THREADS, true>(
+      M, N, K, A, B, C);
   auto block = cooperative_groups::this_thread_block();
   __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> frontBarrier;
   __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> backBarrier;
@@ -135,7 +139,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
   // allocate space for the current blocktile in SMEM
   __shared__ float As[2 * BM * BK];
-  __shared__ float Bs[2 * BK * BN];
+  __shared__ __align__(16) float Bs[2 * BK * BN];
 
   // Move blocktile to beginning of A's row and B's column
   A += cRow * BM * K;

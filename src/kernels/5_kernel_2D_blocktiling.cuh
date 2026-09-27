@@ -7,12 +7,19 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+#include "common.cuh"
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
     sgemm2DBlocktiling(int M, int N, int K, float alpha, const float *A,
                        const float *B, float beta, float *C) {
+  static_assert(TM > 0 && TN > 0 && BM % TM == 0 && BN % TN == 0,
+                "Per-thread tiles must divide the block tile");
+  constexpr int threads = (BM * BN) / (TM * TN);
+  static_assert(threads % BK == 0 && threads % BN == 0 &&
+                    (BM * BK) % threads == 0 && (BN * BK) % threads == 0,
+                "Shared-memory load strides must cover complete tiles");
+  sgemm_detail::require_tiled_launch<BM, BN, BK, threads>(M, N, K, A, B, C);
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
 

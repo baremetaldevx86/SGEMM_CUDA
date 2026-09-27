@@ -7,13 +7,19 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
-#define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
+#include "common.cuh"
 const int K9_NUM_THREADS = 256;
 
 template <const int BM, const int BN, const int BK, const int TM, const int TN>
 __global__ void __launch_bounds__(K9_NUM_THREADS)
     sgemmAutotuned(int M, int N, int K, float alpha, float *A, float *B,
                    float beta, float *C) {
+  static_assert(TM > 0 && TN > 0 && TN % 4 == 0 && BM % (16 * TM) == 0 &&
+                    BN % (16 * TN) == 0,
+                "Autotuned thread tiles must cover the block tile exactly");
+  sgemm_detail::validate_vector_loads<BM, BN, BK, K9_NUM_THREADS>();
+  sgemm_detail::require_tiled_launch<BM, BN, BK, K9_NUM_THREADS, true>(
+      M, N, K, A, B, C);
   const uint cRow = blockIdx.y;
   const uint cCol = blockIdx.x;
 
@@ -30,7 +36,7 @@ __global__ void __launch_bounds__(K9_NUM_THREADS)
 
   // allocate space for the current blocktile in smem
   __shared__ float As[BM * BK];
-  __shared__ float Bs[BK * BN];
+  __shared__ __align__(16) float Bs[BK * BN];
 
   // Move blocktile to beginning of A's row and B's column
   A += cRow * BM * K;
